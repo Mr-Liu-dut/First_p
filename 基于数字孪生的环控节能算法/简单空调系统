@@ -1,0 +1,186 @@
+#数据预处理
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+plt.rc('font', family='SimHei', size=13)
+
+# 读取数据
+data = pd.read_csv('work1.csv')
+
+
+print(data.isnull().sum())
+
+from sklearn.preprocessing import StandardScaler
+scaler = StandardScaler()
+scaled_data = scaler.fit_transform(data)
+
+
+# 热力学过程模拟
+def thermodynamic_model(T_out, H_out, flow_rate):
+    """
+    简化的空调热力学模型
+    参数:
+        T_out: 外部温度(°C)
+        H_out: 外部湿度(%)
+        flow_rate: 流量(m³/h)
+    返回:
+        cooling_power: 制冷功率(W)
+        energy_consumption: 能耗(kWh)
+    """
+    # 假设的模型参数(实际应根据具体空调系统调整)
+    COP = 3.5  # 制冷系数
+    heat_transfer_coeff = 0.8  # 热传递系数
+
+    # 计算制冷量
+    Q = flow_rate * heat_transfer_coeff * (T_out - 24)  # 假设目标温度为24°C
+
+    # 计算能耗
+    energy = Q / COP
+
+    return Q, energy
+
+
+# 热力学过程模拟
+def thermodynamic_model(T_out, H_out, flow_rate):
+    """
+    简化的空调热力学模型
+    参数:
+        T_out: 外部温度(°C)
+        H_out: 外部湿度(%)
+        flow_rate: 流量(m³/h)
+    返回:
+        cooling_power: 制冷功率(W)
+        energy_consumption: 能耗(kWh)
+    """
+    # 假设的模型参数(实际应根据具体空调系统调整)
+    COP = 3.5 * (1 - 0.005 * (flow_rate - 300))  # 流量偏离300时COP降低
+    Q = flow_rate * 0.8 * (T_out - 24)
+    energy = Q / COP if COP != 0 else 0
+    return Q, energy
+
+def calculate_efficiency(data):
+    results = []
+    for idx, row in data.iterrows():
+        cooling_power, energy = thermodynamic_model(row['temperature'],
+                                                   row['humidity'],
+                                                   row['flow'])
+        efficiency = cooling_power / energy if energy != 0 else 0
+        results.append({
+            'cooling_power': cooling_power,
+            'energy': energy,
+            'efficiency': efficiency
+        })
+    return pd.DataFrame(results)
+
+# 执行计算
+efficiency_results = calculate_efficiency(data)
+
+# 分析能效与环境因素的关系
+correlation_matrix = data.corrwith(efficiency_results['efficiency'])
+print("能效与环境因素的相关系数:")
+print(correlation_matrix)
+# PID控制算法实现
+class PIDController:
+    def __init__(self, Kp, Ki, Kd, setpoint):
+        self.Kp = Kp  # 比例系数
+        self.Ki = Ki  # 积分系数
+        self.Kd = Kd  # 微分系数
+        self.setpoint = setpoint  # 目标温度
+        self.prev_error = 0
+        self.integral = 0
+
+    def update(self, measured_value, dt):
+        error = self.setpoint - measured_value
+
+        # 比例项
+        P = self.Kp * error
+
+        # 积分项
+        self.integral += error * dt
+        I = self.Ki * self.integral
+
+        # 微分项
+        derivative = (error - self.prev_error) / dt
+        D = self.Kd * derivative
+
+        # 保存当前误差供下次计算
+        self.prev_error = error
+
+        # 计算输出
+        output = P + I + D
+
+        return output
+
+
+# 初始化PID控制器(参数需要根据系统响应调整)
+pid = PIDController(Kp=5.0, Ki=0.5, Kd=1.0, setpoint=23.0)
+
+
+# 模拟控制过程
+def simulate_control(data, pid_controller):
+    controlled_flow = []
+    current_flow = data['flow'].mean()  # 初始流量
+    dt = 1  # 时间步长(假设1小时)
+
+    for temp in data['temperature']:
+        # 获取PID输出(调整流量)
+        flow_adjustment = pid_controller.update(temp, dt)
+
+        # 应用调整(限制流量在合理范围内)
+        current_flow = max(200, min(350, current_flow + flow_adjustment))
+        controlled_flow.append(current_flow)
+
+    return controlled_flow
+
+
+# 执行控制模拟
+optimal_flow = simulate_control(data, pid)
+data['optimal_flow'] = optimal_flow
+
+
+# 系统优化与能效提升
+def optimize_system(data):
+    # 计算原始能效
+    original_results = calculate_efficiency(data)
+
+    # 计算优化后的能效(使用PID控制后的流量)
+    optimized_data = data.copy()
+    optimized_data['flow'] = optimized_data['optimal_flow']
+    optimized_results = calculate_efficiency(optimized_data)
+    # 比较结果
+    energy_saving = (original_results['energy'].sum() - optimized_results['energy'].sum()) / original_results[
+        'energy'].sum() * 100
+
+    print(f"预计节能: {energy_saving:.2f}%")
+
+    return optimized_results
+
+
+# 执行优化
+optimized_results = optimize_system(data)
+
+import matplotlib.pyplot as plt
+
+# 温度与优化流量的关系
+plt.figure(figsize=(10, 5))
+plt.scatter(data['temperature'], data['flow'], label='原始流量')
+plt.scatter(data['temperature'], data['optimal_flow'], label='优化流量')
+plt.xlabel('温度 (°C)')
+plt.ylabel('流量 (m³/h)')
+plt.title('温度与流量优化关系')
+plt.legend()
+plt.grid()
+plt.show()
+
+# 能效比较
+plt.figure(figsize=(10, 5))
+plt.plot(optimized_results.index, optimized_results['efficiency'],
+         label='优化后能效', color='red', linestyle='--')
+plt.plot(optimized_results.index, calculate_efficiency(data)['efficiency'],
+         label='原始能效', color='blue')
+plt.xlabel('数据点')
+plt.ylabel('能效比')
+plt.title('能效优化比较')
+plt.legend()
+plt.grid()
+plt.show()
