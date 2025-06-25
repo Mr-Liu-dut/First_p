@@ -1,0 +1,124 @@
+1.动态COP模型优化
+# 优化后的动态COP模型
+class ACEfficiency:
+    def __init__(self):
+        self.COP_nominal = 4.0  # 额定工况COP
+    
+    def get_cop(self, T_cond, T_evap, load_ratio):
+        """基于冷凝/蒸发温度和负载率动态计算COP"""
+        cop = self.COP_nominal * (1 - 0.015*(T_cond-35)) * (0.8 + 0.2*load_ratio)
+        return max(2.0, cop)  # COP下限保护
+
+
+2. 压缩机效率曲线引入
+# 引入压缩机效率曲线
+def calculate_work(self, mass_flow_rate, T_in, P_in, T_out, P_out):
+    # 计算理论等熵功
+    h_in = self.get_enthalpy(T_in, P_in)
+    h_out_ideal = CP.PropsSI('H', 'S', CP.PropsSI('S', 'T', T_in+273.15, 'P', P_in*1e3, self.refrigerant), 
+                           'P', P_out*1e3, self.refrigerant)
+    ideal_work = mass_flow_rate * (h_out_ideal - h_in)
+    
+    # 引入压缩机效率曲线 (拟合实际设备数据)
+    compressor_efficiency = 0.9 - 0.1*(mass_flow_rate/0.5)**2  # 示例曲线
+    return ideal_work / max(0.5, compressor_efficiency)
+
+
+
+3.模糊自适应PID控制
+class FuzzyPID:
+    def __init__(self):
+        self.Kp_range = [1.0, 5.0]
+        self.error_history = []
+        
+    def adjust_gains(self, error):
+        # 根据误差历史动态调整PID参数
+        self.error_history.append(error)
+        if len(self.error_history) > 5:
+            error_trend = np.polyfit(range(5), self.error_history[-5:], 1)[0]
+            # 误差增大时增强控制
+            if abs(error_trend) > 0.1:
+                self.Kp = min(self.Kp_range[1], self.Kp*1.2)
+            else:
+                self.Kp = max(self.Kp_range[0], self.Kp*0.9)
+
+
+3.热力循环优化
+def simulate_evap(self, mass_flow, P_cond, P_evap):
+    """模拟膨胀阀节流过程"""
+    h_in = CP.PropsSI('H', 'P', P_cond*1e3, 'Q', 0, self.refrigerant)
+    h_out = CP.PropsSI('H', 'P', P_evap*1e3, 'S', 
+                      CP.PropsSI('S', 'P', P_cond*1e3, 'Q', 0, self.refrigerant), 
+                      self.refrigerant)
+return mass_flow * (h_in - h_out)  # 制冷效应
+
+4.主模拟流程优化
+def simulate_optimized_system(file_path):
+    # 初始化组件
+    thermo = ACSystemThermodynamics("R134a")
+    efficiency = ACEfficiency()
+    controller = FuzzyPID()
+    
+    # 加载数据
+    data = pd.read_csv(file_path)
+    
+    results = []
+    for idx, row in data.iterrows():
+        # 环境参数
+        T_amb = row['temperature']
+        humidity = row['humidity']
+        
+        # 控制计算
+        control_signal = controller.adjust_system(T_amb)
+        
+        # 动态压力设定 (随温度变化)
+        P_cond = min(12.0, 8.0 + 0.3*(T_amb-25))  # 冷凝压力动态调整
+        P_evap = max(2.0, 3.5 - 0.1*(T_amb-25))   # 蒸发压力动态调整
+        
+        # 热力循环计算
+        m_flow = 0.001 * row['flow'] * (1 + 0.05*control_signal)
+        comp_work = thermo.calculate_work(m_flow, T_amb, P_evap, T_amb+10, P_cond)
+        cooling_effect = thermo.simulate_evap(m_flow, P_cond, P_evap)
+        
+        # 动态COP计算
+        load_ratio = m_flow / 0.5  # 假设额定流量0.5kg/s
+        cop = efficiency.get_cop(P_cond, P_evap, load_ratio)
+        
+        results.append({
+            'temp': T_amb,
+            'cop': cop,
+            'energy': comp_work,
+            'cooling': cooling_effect
+        })
+    
+return pd.DataFrame(results)
+
+
+
+5.电子膨胀阀模型
+def simulate_evap(self, mass_flow, P_cond, P_evap):
+    """膨胀阀模型-考虑过冷度和闪发气体"""
+    # 膨胀前状态（假设5K过冷）
+    h_in = CP.PropsSI('H', 'P', P_cond*1e3, 'T', 
+                     CP.PropsSI('T', 'P', P_cond*1e3, 'Q', 0, self.refrigerant)-5,
+                     self.refrigerant)
+    
+    # 膨胀后闪发气体比例计算
+    quality = CP.PropsSI('Q', 'P', P_evap*1e3, 'H', h_in, self.refrigerant)
+    
+    # 有效制冷量 = 质量流量 × (h_蒸发器入口 - h_蒸发器出口)
+    h_out = CP.PropsSI('H', 'P', P_evap*1e3, 'Q', 0, self.refrigerant)
+return mass_flow * (h_in - h_out) * (1 - 0.2*quality)  # 闪发气体损失修正
+
+
+6.基于数字孪生的校队算法
+def online_calibration(real_power, predicted_power):
+    from filterpy.kalman import ExtendedKalmanFilter
+    ekf = ExtendedKalmanFilter(dim_x=3, dim_z=1)
+    
+    # 状态变量: [COP修正因子, 压缩机效率, 膨胀阀损失系数]
+    def f(x): return x  # 状态不变
+    def h(x): return x[0]*x[1]*cooling_model(x[2]) 
+    
+    ekf.predict_update(real_power, f, h)
+return ekf.x
