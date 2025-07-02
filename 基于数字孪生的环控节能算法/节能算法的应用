@@ -1,0 +1,430 @@
+import pandas as pd
+import numpy as np
+import CoolProp.CoolProp as CP
+import matplotlib.pyplot as plt
+import matplotlib as mpl
+
+# 设置中文字体支持
+plt.rcParams['font.sans-serif'] = ['SimHei']  # 用来正常显示中文标签
+plt.rcParams['axes.unicode_minus'] = False  # 用来正常显示负号
+
+
+# 空调系统热力学模型（改进版）
+class ACSystemThermodynamics:
+    def __init__(self, refrigerant="R134a", max_power=3000):
+        self.refrigerant = refrigerant
+        self.max_power = max_power  # 最大允许功率
+
+    def get_enthalpy(self, T, P):
+        """获取特定温度和压力下冷媒的焓值，增加更完善的错误处理"""
+        try:
+            h = CP.PropsSI('H', 'T', T + 273.15, 'P', P * 1e5, self.refrigerant)
+            return h
+        except:
+            return 250000  # 典型焓值 J/kg
+
+    def calculate_power(self, mass_flow_rate, T_in, P_in, T_out, P_out, work_ratio):
+        """计算压缩机功率，增加功率限制"""
+        h_in = self.get_enthalpy(T_in, P_in)
+        h_out = self.get_enthalpy(T_out, P_out)
+
+        # 确保焓差合理
+        h_diff = max(30000, h_out - h_in)  # 最小焓差30kJ/kg
+
+        power = mass_flow_rate * h_diff  # 单位：W
+        power_with_ratio = power * work_ratio
+
+        # 应用功率限制 - 提高最小功率到100W
+        limited_power = max(100, min(power_with_ratio, self.max_power))
+        return limited_power
+
+
+# 空调系统能效计算（改进版）
+class ACEfficiency:
+    def __init__(self, cop_base=4.0, min_cop=2.0, max_cop=5.0):
+        """初始化空调的COP，考虑COP随负载变化"""
+        self.cop_base = cop_base
+        self.min_cop = min_cop
+        self.max_cop = max_cop
+
+    def calculate_cop(self, power):
+        """根据功率计算实际COP，低负载时COP降低"""
+        load_ratio = power / 3000.0  # 相对于最大功率的负载比
+        cop = self.cop_base * (0.8 + 0.2 * load_ratio)  # 负载越低COP越低
+        return max(self.min_cop, min(cop, self.max_cop))
+
+    def calculate_cooling_capacity(self, power):
+        """根据功率和实际COP计算制冷能力 - 移除最大制冷量限制"""
+        if power <= 0:
+            return 0
+
+        cop = self.calculate_cop(power)
+        cooling_capacity = power * cop
+        return cooling_capacity  # 移除3000W限制
+
+
+# 控制算法（优化版PID）
+class ACControl:
+    def __init__(self, set_point=24.0, Kp=0.3, Ki=0.01, Kd=0.04):
+        """初始化PID控制器，调整参数提高响应速度"""
+        self.set_point = set_point
+        self.pid = PID(Kp, Ki, Kd)
+
+    def adjust_system(self, current_temp, outdoor_temp):
+        """根据当前温度和室外温度调整控制信号"""
+        # 增加室外温度对控制信号的影响
+        temp_diff = outdoor_temp - current_temp
+        control_signal = self.pid.compute(self.set_point, current_temp)
+
+        # 室外温度越高，控制信号越大
+        outdoor_factor = min(1.0, max(0.5, temp_diff / 10.0))
+        adjusted_signal = control_signal * outdoor_factor
+
+        return min(max(adjusted_signal, 0), 1.0)  # 限制在0-1范围内
+
+
+class PID:
+    def __init__(self, Kp, Ki, Kd):
+        self.Kp = Kp
+        self.Ki = Ki
+        self.Kd = Kd
+        self.prev_error = 0
+        self.integral = 0
+        self.integral_limit = 1.5  # 调整积分限幅
+
+    def compute(self, set_point, current_value):
+        error = set_point - current_value
+
+        # 改进的积分处理
+        if abs(error) < 0.2:
+            self.integral *= 0.9  # 接近目标时缓慢衰减积分
+        else:
+            self.integral += error
+
+        # 积分限幅
+        self.integral = np.clip(self.integral, -self.integral_limit, self.integral_limit)
+
+        derivative = error - self.prev_error
+        output = self.Kp * error + self.Ki * self.integral + self.Kd * derivative
+        self.prev_error = error
+
+        return np.clip(output, 0, 1.2)  # 调整输出范围
+
+
+# 节能控制器（优化版） - 增强启动过程
+class EnergySavingController:
+    def __init__(self, target_temp=24.0, max_temp_diff=8.0, min_power_ratio=0.08):
+        """初始化节能控制器，调整参数提高稳定性"""
+        self.target_temp = target_temp
+        self.max_temp_diff = max_temp_diff
+        self.min_power_ratio = min_power_ratio  # 最小功率比例
+        self.last_ratio = 0.0
+        self.max_change = 0.05  # 最大变化率
+        self.ramp_up_duration = 0.5  # 启动阶段缩短
+        self.ramp_up_completed = False
+        self.temp_history = []
+        self.overshoot_counter = 0
+        self.cooling_on = True
+
+    def calculate_work_ratio(self, indoor_temp, outdoor_temp, elapsed_hours):
+        """计算工作比例，改进温度超调检测和自适应控制 - 增强启动过程"""
+        # 记录温度历史
+        self.temp_history.append(indoor_temp)
+        if len(self.temp_history) > 8:
+            self.temp_history.pop(0)
+
+        # 检测温度超调（更敏感的检测）
+        overshoot_threshold = 0.25  # 调整超调阈值
+        if indoor_temp < self.target_temp - overshoot_threshold or indoor_temp > self.target_temp + overshoot_threshold:
+            self.overshoot_counter += 1
+        else:
+            self.overshoot_counter = max(0, self.overshoot_counter - 1)
+
+        # 自适应最小功率比例
+        adaptive_min_ratio = self.min_power_ratio
+        if self.overshoot_counter > 3:
+            adaptive_min_ratio = max(0.03, self.min_power_ratio * 0.9)  # 超调时降低最小比例
+
+        # 计算温度偏差
+        temp_deviation = indoor_temp - self.target_temp
+
+        # 启动阶段 - 强制高功率运行
+        if elapsed_hours < self.ramp_up_duration:
+            # 前0.5小时强制高功率运行
+            ramp_ratio = min(0.9, 0.6 + 0.6 * (elapsed_hours / self.ramp_up_duration))
+            self.last_ratio = ramp_ratio
+            return ramp_ratio
+
+        # 温度控制逻辑（更精确的阈值）
+        if temp_deviation < -0.15:  # 低于目标0.15°C以上
+            target_ratio = 0.0
+            self.cooling_on = False
+        elif temp_deviation > 0.15:  # 高于目标0.15°C以上
+            self.cooling_on = True
+            # 温差因子计算
+            temp_diff = abs(outdoor_temp - indoor_temp)
+            temp_diff_factor = np.clip(temp_diff / self.max_temp_diff, 0.2, 1.0)
+
+            # 偏差因子计算
+            deviation_factor = np.clip(abs(temp_deviation) / 1.5, 0.2, 1.0)
+
+            # 综合工作比例
+            target_ratio = 0.3 * deviation_factor + 0.3 * temp_diff_factor
+
+            # 温度波动平滑处理
+            if len(self.temp_history) >= 3:
+                temp_std = np.std(self.temp_history[-3:])
+                if temp_std > 0.2:  # 温度波动大时降低目标比例
+                    target_ratio = min(target_ratio, self.last_ratio * 0.95)
+        else:  # 在目标温度附近
+            target_ratio = adaptive_min_ratio
+
+        # 平滑过渡（限制变化率）
+        if target_ratio > self.last_ratio:
+            new_ratio = min(self.last_ratio + self.max_change, target_ratio)
+        else:
+            new_ratio = max(self.last_ratio - self.max_change, target_ratio)
+
+        # 应用最小比例限制
+        if self.cooling_on:
+            new_ratio = max(adaptive_min_ratio, min(new_ratio, 0.9))  # 最大工作比例0.9
+        else:
+            new_ratio = 0
+
+        self.last_ratio = new_ratio
+        return new_ratio
+
+
+# 生成模拟的夏天温度曲线（优化版）
+def generate_summer_temperature(start_temp=28.3, duration_hours=24):
+    """生成更真实的温度曲线，调整波动幅度"""
+    hours = np.linspace(0, duration_hours, duration_hours * 4)
+
+    # 基本温度曲线
+    base_temp = start_temp + 5.0 * np.sin((hours - 6) * np.pi / 12)  # 增大温度波动
+
+    # 趋势调整
+    trend = np.zeros(len(hours))
+    trend[hours < 6] = -0.06 * hours[hours < 6]
+    trend[(hours >= 6) & (hours < 14)] = 0.18 * (hours[(hours >= 6) & (hours < 14)] - 6)
+    trend[(hours >= 14) & (hours < 20)] = 0.18 * (14 - hours[(hours >= 14) & (hours < 20)])
+    trend[hours >= 20] = -0.12 * (hours[hours >= 20] - 20)
+
+    # 组合温度
+    temperatures = base_temp + trend
+
+    # 调整随机波动
+    noise = np.random.normal(0, 0.3, len(hours))
+    temperatures += noise
+
+    # 湿度和流量
+    humidities = 60 - 0.8 * (temperatures - np.mean(temperatures)) + np.random.normal(0, 3, len(hours))
+    humidities = np.clip(humidities, 30, 75)
+
+    flows = 240 + 2.5 * (temperatures - np.min(temperatures)) + np.random.normal(0, 12, len(hours))
+    flows = np.clip(flows, 200, 380)
+
+    data = pd.DataFrame({
+        'hour': hours,
+        'temperature': temperatures,
+        'humidity': humidities,
+        'flow': flows
+    })
+    return data
+
+
+# 模拟空调系统的工作状态（优化版） - 修复启动过程
+def simulate_ac_system_with_energy_saving(target_temp=24.0):
+    """模拟空调系统运行，整合所有改进 - 修复启动过程"""
+    data = generate_summer_temperature(start_temp=28.3, duration_hours=24)
+
+    # 创建改进的系统组件
+    thermodynamics = ACSystemThermodynamics(max_power=3000)  # 明确最大功率
+    efficiency = ACEfficiency()
+    control = ACControl(set_point=target_temp)
+    energy_saver = EnergySavingController(target_temp=target_temp)
+
+    # 初始化参数 - 调整房间热容和初始温差
+    indoor_temps = [data.iloc[0]['temperature'] + 3.0]  # 初始温差加大到3°C
+    cooling_capacities = []
+    work_inputs = []
+    work_ratios = []
+    outdoor_temp_list = []
+    control_signals = []
+
+    # 热力学参数
+    C = 10.0e6  # 房间热容
+    K = 35  # 热传导系数
+    Q_solar = 1000  # 太阳辐射
+    dt = 900  # 时间步长 (15分钟)
+
+    # 模拟过程
+    elapsed_hours = 0.0
+    for i in range(1, len(data)):
+        current_outdoor_temp = data.iloc[i]['temperature']
+        humidity = data.iloc[i]['humidity']
+        flow = data.iloc[i]['flow']
+        outdoor_temp_list.append(current_outdoor_temp)
+
+        elapsed_hours += 0.25
+        current_indoor_temp = indoor_temps[-1]
+
+        # 计算工作比例
+        work_ratio = energy_saver.calculate_work_ratio(
+            current_indoor_temp,
+            current_outdoor_temp,
+            elapsed_hours
+        )
+        work_ratios.append(work_ratio)
+
+        # 计算控制信号（加入室外温度）
+        control_signal = control.adjust_system(current_indoor_temp, current_outdoor_temp)
+        control_signals.append(control_signal)
+
+        # 质量流量计算
+        mass_flow_rate = flow * 0.0012  # 调整转换系数
+
+        # 温度参数（改进温差计算）
+        T_in = current_indoor_temp
+        temp_deviation = current_indoor_temp - target_temp
+        base_temp_diff = 1.8
+        dynamic_adjust = min(1.2, max(0, abs(temp_deviation) * 0.6))
+        temp_diff = base_temp_diff + dynamic_adjust
+        T_out = T_in - temp_diff
+
+        # 压力参数
+        P_in = 2.2  # 调整进气压力
+        P_out = 5.8  # 调整出气压力
+
+        # 计算功率（应用工作比例）
+        work_input = thermodynamics.calculate_power(
+            mass_flow_rate, T_in, P_in, T_out, P_out, work_ratio
+        )
+        work_inputs.append(work_input)
+
+        # 计算制冷能力
+        cooling_capacity = efficiency.calculate_cooling_capacity(work_input)
+        cooling_capacities.append(cooling_capacity)
+
+        # 计算下一时刻温度（改进热模型） - 移除人为变化限制
+        heat_transfer = K * (current_outdoor_temp - current_indoor_temp)
+        current_hour = elapsed_hours % 24
+        solar_gain = Q_solar if 7.5 <= current_hour < 18.5 else 0  # 调整太阳辐射时间
+
+        # 温度变化计算 - 直接使用物理计算值
+        dT = (heat_transfer + solar_gain - cooling_capacity) * dt / C
+        new_indoor_temp = current_indoor_temp + dT
+
+        # 温度合理性检查
+        new_indoor_temp = max(16, min(new_indoor_temp, 35))  # 温度物理限制
+        indoor_temps.append(new_indoor_temp)
+
+    # 动态Y轴范围计算
+    min_temp = min(min(data['temperature']), min(indoor_temps)) - 1
+    max_temp = max(max(data['temperature']), max(indoor_temps)) + 1
+
+    # 可视化结果
+    plt.figure(figsize=(16, 10))
+
+    # 温度变化图
+    plt.subplot(2, 2, 1)
+    plt.plot(data['hour'][1:], indoor_temps[1:], label="室内温度 (°C)", color='blue', linewidth=2)
+    plt.plot(data['hour'], data['temperature'], label="室外温度 (°C)", color='red', alpha=0.7)
+    plt.axhline(y=target_temp, color='green', linestyle='--', label="目标温度")
+    plt.axhspan(target_temp - 0.5, target_temp + 0.5, color='lightgreen', alpha=0.2, label="舒适范围")
+    plt.title(f"室内外温度变化 (目标温度: {target_temp}°C)", fontsize=14)
+    plt.xlabel("时间 (小时)", fontsize=12)
+    plt.ylabel("温度 (°C)", fontsize=12)
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.ylim(min_temp, max_temp)
+
+    # 功率变化图
+    plt.subplot(2, 2, 2)
+    plt.plot(data['hour'][1:], work_inputs, label="输入功率 (W)", color='orange')
+    plt.axhline(y=3000, color='red', linestyle='--', label="最大功率限制")
+    plt.title(f"空调输入功率 (目标温度: {target_temp}°C)", fontsize=14)
+    plt.xlabel("时间 (小时)", fontsize=12)
+    plt.ylabel("功率 (W)", fontsize=12)
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.ylim(0, 3300)  # 固定Y轴范围便于观察
+
+    # 工作比例变化图
+    plt.subplot(2, 2, 3)
+    plt.plot(data['hour'][1:], work_ratios, label="工作比例", color='brown')
+    plt.fill_between(data['hour'][1:], work_ratios, 0, color='brown', alpha=0.3)
+    plt.title("节能控制器工作比例", fontsize=14)
+    plt.xlabel("时间 (小时)", fontsize=12)
+    plt.ylabel("工作比例 (0-1)", fontsize=12)
+    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.ylim(0, 1.0)
+
+    # 累计能耗图
+    plt.subplot(2, 2, 4)
+    cumulative_energy = np.cumsum(work_inputs) * dt / 3600000  # 转换为kWh
+    plt.plot(data['hour'][1:], cumulative_energy, label="累计能耗", color='darkred')
+    plt.title(f"空调累计能耗 (目标温度: {target_temp}°C)", fontsize=14)
+    plt.xlabel("时间 (小时)", fontsize=12)
+    plt.ylabel("能耗 (kWh)", fontsize=12)
+    plt.grid(True, linestyle='--', alpha=0.7)
+
+    plt.tight_layout()
+    plt.savefig(f'空调系统优化_{target_temp}°C_性能分析.png', dpi=300, bbox_inches='tight')
+    plt.show()
+
+    # 计算并打印性能数据
+    total_energy = cumulative_energy[-1] if len(cumulative_energy) > 0 else 0
+    avg_work_ratio = np.mean(work_ratios) if work_ratios else 0
+    avg_indoor_temp = np.mean(indoor_temps) if indoor_temps else 0
+    temp_deviation = np.std(indoor_temps) if indoor_temps else 0
+    max_power = max(work_inputs) if work_inputs else 0
+    min_indoor_temp = min(indoor_temps) if indoor_temps else 0
+    max_indoor_temp = max(indoor_temps) if indoor_temps else 0
+
+    # 温度在目标范围内的比例
+    lower_bound = target_temp - 0.5
+    upper_bound = target_temp + 0.5
+    in_target_range = sum(1 for t in indoor_temps if lower_bound <= t <= upper_bound) / len(indoor_temps) * 100
+
+    print(f"\n目标温度 {target_temp}°C 优化后性能分析")
+    print("=" * 60)
+    print(f"总能耗: {total_energy:.3f} kWh")
+    print(f"平均工作比例: {avg_work_ratio:.3f}")
+    print(f"最大功率: {max_power:.1f} W (限制: 3000W)")
+    print(f"室内温度范围: {min_indoor_temp:.1f}°C 至 {max_indoor_temp:.1f}°C")
+    print(f"室内平均温度: {avg_indoor_temp:.3f} °C (目标: {target_temp}°C)")
+    print(f"温度标准差: {temp_deviation:.3f} °C")
+    print(f"温度在{lower_bound:.1f}-{upper_bound:.1f}°C范围内的比例: {in_target_range:.1f}%")
+    print(f"平均COP: {np.mean([efficiency.calculate_cop(w) for w in work_inputs if w > 0]):.2f}")
+    print("=" * 60)
+
+    # 保存结果
+    result_df = pd.DataFrame({
+        '时间': data['hour'][1:],
+        '室外温度': outdoor_temp_list,
+        '室内温度': indoor_temps[1:],
+        '制冷能力(W)': cooling_capacities,
+        '输入功率(W)': work_inputs,
+        '工作比例': work_ratios,
+        '控制信号': control_signals
+    })
+    result_df.to_csv(f'空调系统优化_{target_temp}°C_模拟结果.csv', index=False)
+
+    return result_df
+
+
+# 主函数
+if __name__ == "__main__":
+    print("空调系统节能模拟程序（优化版）")
+    print("=" * 50)
+
+    try:
+        target_temp = float(input("请输入目标温度 (°C, 建议范围22-26): ") or "24")
+        target_temp = max(20, min(target_temp, 28))  # 限制温度范围
+    except:
+        target_temp = 24  # 默认温度
+
+    print(f"\n开始模拟空调系统运行 (目标温度: {target_temp}°C)...")
+    results = simulate_ac_system_with_energy_saving(target_temp=target_temp)
+    print("模拟完成! 结果已保存到文件")
