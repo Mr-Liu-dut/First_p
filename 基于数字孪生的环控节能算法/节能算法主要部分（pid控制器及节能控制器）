@@ -1,0 +1,130 @@
+# 控制算法（优化版PID）
+class ACControl:
+    def __init__(self, set_point=24.0, Kp=0.3, Ki=0.01, Kd=0.04):
+        """初始化PID控制器，调整参数提高响应速度"""
+        self.set_point = set_point
+        self.pid = PID(Kp, Ki, Kd)
+
+    def adjust_system(self, current_temp, outdoor_temp):
+        """根据当前温度和室外温度调整控制信号"""
+        # 增加室外温度对控制信号的影响
+        temp_diff = outdoor_temp - current_temp
+        control_signal = self.pid.compute(self.set_point, current_temp)
+
+        # 室外温度越高，控制信号越大
+        outdoor_factor = min(1.0, max(0.5, temp_diff / 10.0))
+        adjusted_signal = control_signal * outdoor_factor
+
+        return min(max(adjusted_signal, 0), 1.0)  # 限制在0-1范围内
+
+
+class PID:
+    def __init__(self, Kp, Ki, Kd):
+        self.Kp = Kp
+        self.Ki = Ki
+        self.Kd = Kd
+        self.prev_error = 0
+        self.integral = 0
+        self.integral_limit = 1.5  # 调整积分限幅
+
+    def compute(self, set_point, current_value):
+        error = set_point - current_value
+
+        # 改进的积分处理
+        if abs(error) < 0.2:
+            self.integral *= 0.9  # 接近目标时缓慢衰减积分
+        else:
+            self.integral += error
+
+        # 积分限幅
+        self.integral = np.clip(self.integral, -self.integral_limit, self.integral_limit)
+
+        derivative = error - self.prev_error
+        output = self.Kp * error + self.Ki * self.integral + self.Kd * derivative
+        self.prev_error = error
+
+        return np.clip(output, 0, 1.2)  # 调整输出范围
+
+
+# 节能控制器（优化版） - 增强启动过程
+class EnergySavingController:
+    def __init__(self, target_temp=24.0, max_temp_diff=8.0, min_power_ratio=0.08):
+        """初始化节能控制器，调整参数提高稳定性"""
+        self.target_temp = target_temp
+        self.max_temp_diff = max_temp_diff
+        self.min_power_ratio = min_power_ratio  # 最小功率比例
+        self.last_ratio = 0.0
+        self.max_change = 0.05  # 最大变化率
+        self.ramp_up_duration = 0.5  # 启动阶段缩短
+        self.ramp_up_completed = False
+        self.temp_history = []
+        self.overshoot_counter = 0
+        self.cooling_on = True
+
+    def calculate_work_ratio(self, indoor_temp, outdoor_temp, elapsed_hours):
+        """计算工作比例，改进温度超调检测和自适应控制 - 增强启动过程"""
+        # 记录温度历史
+        self.temp_history.append(indoor_temp)
+        if len(self.temp_history) > 8:
+            self.temp_history.pop(0)
+
+        # 检测温度超调（更敏感的检测）
+        overshoot_threshold = 0.25  # 调整超调阈值
+        if indoor_temp < self.target_temp - overshoot_threshold or indoor_temp > self.target_temp + overshoot_threshold:
+            self.overshoot_counter += 1
+        else:
+            self.overshoot_counter = max(0, self.overshoot_counter - 1)
+
+        # 自适应最小功率比例
+        adaptive_min_ratio = self.min_power_ratio
+        if self.overshoot_counter > 3:
+            adaptive_min_ratio = max(0.03, self.min_power_ratio * 0.9)  # 超调时降低最小比例
+
+        # 计算温度偏差
+        temp_deviation = indoor_temp - self.target_temp
+
+        # 启动阶段 - 强制高功率运行
+        if elapsed_hours < self.ramp_up_duration:
+            # 前0.5小时强制高功率运行
+            ramp_ratio = min(0.9, 0.6 + 0.6 * (elapsed_hours / self.ramp_up_duration))
+            self.last_ratio = ramp_ratio
+            return ramp_ratio
+
+        # 温度控制逻辑（更精确的阈值）
+        if temp_deviation < -0.15:  # 低于目标0.15°C以上
+            target_ratio = 0.0
+            self.cooling_on = False
+        elif temp_deviation > 0.15:  # 高于目标0.15°C以上
+            self.cooling_on = True
+            # 温差因子计算
+            temp_diff = abs(outdoor_temp - indoor_temp)
+            temp_diff_factor = np.clip(temp_diff / self.max_temp_diff, 0.2, 1.0)
+
+            # 偏差因子计算
+            deviation_factor = np.clip(abs(temp_deviation) / 1.5, 0.2, 1.0)
+
+            # 综合工作比例
+            target_ratio = 0.3 * deviation_factor + 0.3 * temp_diff_factor
+
+            # 温度波动平滑处理
+            if len(self.temp_history) >= 3:
+                temp_std = np.std(self.temp_history[-3:])
+                if temp_std > 0.2:  # 温度波动大时降低目标比例
+                    target_ratio = min(target_ratio, self.last_ratio * 0.95)
+        else:  # 在目标温度附近
+            target_ratio = adaptive_min_ratio
+
+        # 平滑过渡（限制变化率）
+        if target_ratio > self.last_ratio:
+            new_ratio = min(self.last_ratio + self.max_change, target_ratio)
+        else:
+            new_ratio = max(self.last_ratio - self.max_change, target_ratio)
+
+        # 应用最小比例限制
+        if self.cooling_on:
+            new_ratio = max(adaptive_min_ratio, min(new_ratio, 0.9))  # 最大工作比例0.9
+        else:
+            new_ratio = 0
+
+        self.last_ratio = new_ratio
+        return new_ratio
